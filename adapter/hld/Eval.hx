@@ -1,0 +1,2070 @@
+package hld;
+import hld.Value;
+
+enum abstract NativeReg(Int) from Int {
+	var Eax = 0;
+	var Ecx = 1;
+	var Edx = 2;
+	var Ebx = 3;
+	var Esp = 4;
+	var Ebp = 5;
+	var Esi = 6;
+	var Edi = 7;
+	var R8 = 8;
+	var R9 = 9;
+	var R10	= 10;
+	var R11	= 11;
+	var R12	= 12;
+	var R13	= 13;
+	var R14	= 14;
+	var R15	= 15;
+	public static function XMM(v:Int) return v + 16;
+	public inline function toInt() return this;
+	public inline function isFpu() return this >= 16;
+	public inline function is64() return this >= 8 && this < 16;
+}
+
+enum VarAddress {
+	ANone;
+	AUndef( t : HLType );
+	AOverwritten( t : HLType );
+	AAddr( ptr : Pointer, t : HLType );
+	AMethod( v : Value, ptr : Pointer, t : HLType );
+	AEvaled( v : Value );
+	AInlined( fields : Array<InlinedField> );
+	ANative( v : NativeReg, t : HLType );
+}
+
+typedef VarRecord = { id : Int, start : Int, end : Int, reg : Int };
+
+class Eval {
+
+	var align : Align;
+	var api : Api;
+	var jit : JitInfo;
+	var module : Module;
+	var sizeofVArray : Int;
+	var parser : hscript.Parser;
+
+	var t_string : HLType;
+
+	var funIndex : Int;
+	var codePos : Int;
+	var nativeCodePos : Int;
+	var ebp : Pointer;
+	var frameChildren : Array<Debugger.StackRawInfo>;
+	var savedRegs : Map<Int, Map<Int,Int>>;
+	var varRecords : Map<Int, Array<VarRecord>>;
+	var opOffsets : Map<Int, Array<Int>>;
+	var guidNames : Int64Map<String>;
+
+	public static inline var TRAMPOLINE_FIDX = -1;
+
+	public var breakRegs : Null<Array<Pointer>>;
+	public var nativeBreak : Bool;
+	public var maxArrLength : Int = 10;
+	public var maxBytesLength : Int = 128;
+	public var maxUnknownBytesLength : Int = 16;
+	public var globalContext = false;
+	public var currentThread : Int;
+	public var allowEvalGetters = true;
+	public var printEvalCall = false;
+
+	static var HASH_PREFIX = "$_h$";
+
+	public function new(module,api,jit) {
+		this.module = module;
+		this.api = api;
+		this.jit = jit;
+		this.align = jit.align;
+		parser = new hscript.Parser();
+		parser.identChars += "$";
+		sizeofVArray = align.ptr * 2 + align.typeSize(HI32) * 2;
+		for( t in module.code.types )
+			switch( t ) {
+			case HObj(o):
+				switch( o.name ) {
+				case "String":
+					t_string = t;
+				default:
+				}
+			default:
+			}
+	}
+
+	public function setContext( funIndex : Int, codePos : Int, nativeCodePos : Int, ebp : Pointer, ?children : Array<Debugger.StackRawInfo> ) {
+		this.funIndex = funIndex;
+		this.codePos = codePos;
+		this.nativeCodePos = nativeCodePos;
+		this.ebp = ebp;
+		this.frameChildren = children;
+	}
+
+	public function onBeforeBreak() {
+		this.guidNames = null;
+	}
+
+	public function eval( expr : String ) : Value {
+		if( expr == null || expr == "" )
+			return null;
+		var ext = Value.extractHint(expr);
+		var expr = try parser.parseString(ext.expr) catch( e : hscript.Expr.Error ) throw hscript.Printer.errorToString(e);
+		var v = evalExpr(expr);
+		v.hint = ext.hint;
+		// additional convert based on hint
+		v = makeValueWithHint(v);
+		return v;
+	}
+
+	public function setValue( expr : String, value : String ) {
+		var v = eval(value);
+		if( v == null ) return null;
+		setPtr(ref(expr),v);
+		return v;
+	}
+
+	public function setPtr( ref : { ptr : Pointer, t : HLType }, value : Value ) : Void {
+		if( ref.ptr.isNull() )
+			throw "Can't set null ptr";
+		value = castTo(value, ref.t);
+		switch( [ref.t, value.v] ) {
+		case [HI32, VInt(i)]:
+			writeI32(ref.ptr, i);
+		case [HBool, VBool(flag)]:
+			var b = new Buffer(1);
+			b.setUI8(0, flag ? 1 : 0);
+			writeMem(ref.ptr, b, 1);
+		case [HF64,VInt(i)]:
+			writeF64(ref.ptr, i);
+		case [HF64,VFloat(f)]:
+			writeF64(ref.ptr, f);
+		default:
+			if( ref.t.isPtr() ) {
+				var ptr = getPtr(value);
+				if( ptr != null || value.v == VNull ) {
+					writePointer(ref.ptr, ptr);
+					return;
+				}
+			}
+			throw "Don't know how to set "+ref.t.toString();
+		}
+	}
+
+	function getPtr( v : Value ) {
+		return switch (v.v) {
+		case VNull: Pointer.make(0,0);
+		case VPointer(p), VString(_, p), VClosure(_,_,p), VArray(_, _, _, p), VMap(_, _, _, _, p), VEnum(_, _, p), VBytes(_,_,p): p;
+		default: null;
+		}
+	}
+
+	function castTo( v : Value, t : HLType ) {
+		if( v == null )
+			return null;
+		if( safeCastTo(v.t, t) )
+			return v;
+		switch( [v.v, t] ) {
+		case [VInt(i), HF64|HF32]:
+			return { v : VFloat(i), t : t };
+		case [VNull, _] if( t.isPtr() ):
+			return { v : VNull, t : t };
+		default:
+		}
+		throw "Don't know how to cast "+v.t.toString()+" to "+t.toString();
+	}
+
+	function safeCastTo( t : HLType, to : HLType ) {
+		if( t == to )
+			return true;
+		if( to == HDyn )
+			return t.isDynamic();
+		switch( [t,to] ) {
+		case [HObj(p), HObj(_)], [HStruct(p), HStruct(_)] if( p.tsuper != null ):
+			return safeCastTo(p.tsuper, to);
+		default:
+		}
+		return false;
+	}
+
+	public function ref( exprSrc : String ) : Debugger.Address {
+		if( exprSrc == null || exprSrc == "" )
+			return null;
+		var expr = try parser.parseString(exprSrc) catch( e : hscript.Expr.Error ) throw hscript.Printer.errorToString(e);
+		var addr = switch( expr ) {
+		case EField(obj, f):
+			var v = evalExpr(obj);
+			readFieldAddress(v, f);
+		case EIdent(i):
+			getVarAddress(i);
+		default:
+			throw "Can't get ref for " + hscript.Printer.toString(expr);
+		}
+		switch( addr ) {
+		case AAddr(ptr, t):
+			return { ptr : ptr, t : t };
+		default:
+			throw "Can't reference " + exprSrc;
+		}
+	}
+
+	function getClosureStack( v : ValueRepr ) : Array<Pointer> {
+		switch( v ) {
+		case VClosure(_, context, p) if( align.is64 && context != null ):
+			var stackCount = readI32(p.offset(20));
+			return [for( i in 0...stackCount ) readPointer(p.offset(32 + i * 8))];
+		default:
+		}
+		return [];
+	}
+
+	function readNatReg( r : NativeReg ) : Pointer {
+		if( breakRegs != null )
+			return breakRegs[r.toInt()];
+		return api.readRegister(currentThread, r.isFpu() ? hld.Api.Register.makeFpu(r.toInt() - 16) : hld.Api.Register.makeCpu(r.toInt()));
+	}
+
+	function getSavedRegs( fidx : Int ) : Map<Int,Int> {
+		if( savedRegs == null ) savedRegs = new Map();
+		var regs = savedRegs.get(fidx);
+		if( regs != null )
+			return regs;
+		regs = new Map();
+		savedRegs.set(fidx, regs);
+		if( fidx == TRAMPOLINE_FIDX ) {
+			var b = jit.trampoline;
+			if( b != null )
+				for( i => r in b.regs )
+					regs.set(r.toInt(), b.regsOffset + i * align.ptr);
+			return regs;
+		}
+		var vars = jit.getFunctionVars(fidx);
+		if( vars == null )
+			return regs;
+		for( i in 0...vars.length >> 4 ) {
+			var p = i << 4;
+			if( vars.getInt32(p) >= 0 )
+				continue;
+			var r = nativeRegIndex(vars.getInt32(p + 12));
+			if( r >= 0 ) regs.set(r, vars.getInt32(p + 4));
+		}
+		return regs;
+	}
+
+	function getVarRecords( fidx : Int ) : Array<VarRecord> {
+		if( varRecords == null ) varRecords = new Map();
+		var recs = varRecords.get(fidx);
+		if( recs != null )
+			return recs;
+		recs = [];
+		varRecords.set(fidx, recs);
+		var vars = jit.getFunctionVars(fidx);
+		if( vars == null )
+			return recs;
+		for( i in 0...vars.length >> 4 ) {
+			var p = i << 4;
+			var id = vars.getInt32(p);
+			if( id < 0 ) continue;
+			recs.push({ id : id, start : vars.getInt32(p + 4), end : vars.getInt32(p + 8), reg : vars.getInt32(p + 12) });
+		}
+		return recs;
+	}
+
+	function isDirectCallee( c : Debugger.StackRawInfo, callerEbp : Null<Pointer> ) : Bool {
+		if( c.ebp == null || callerEbp == null )
+			return false;
+		var base = c.ebp;
+		if( c.fidx == TRAMPOLINE_FIDX ) {
+			var b = jit.trampoline;
+			if( b == null )
+				return false;
+			base = base.offset(b.rbpOffset);
+		}
+		var buf = new Buffer(align.ptr);
+		if( !api.read(base, buf, align.ptr) )
+			return false;
+		return buf.getPointer(0, align) == callerEbp;
+	}
+
+	function readNativeRegAddress( r : NativeReg, t : HLType ) : VarAddress {
+		if( frameChildren != null && frameChildren.length > 0 ) {
+			var callerEbp = ebp;
+			for( c in frameChildren ) {
+				if( !isDirectCallee(c, callerEbp) )
+					return AOverwritten(t);
+				var offset = getSavedRegs(c.fidx).get(r.toInt());
+				if( offset == null ) {
+					if( c.fidx == TRAMPOLINE_FIDX ) return AOverwritten(t);
+					callerEbp = c.ebp;
+					continue;
+				}
+				return AAddr(c.ebp.offset(offset), t);
+			}
+		}
+		return nativeBreak ? AOverwritten(t) : ANative(r, t);
+	}
+
+	function evalExpr( e : hscript.Expr ) : Value {
+		switch( e ) {
+		case EConst(c):
+			switch( c ) {
+			case CInt(v):
+				return { v : VInt(v), t : HI32 };
+			case CFloat(f):
+				return { v : VFloat(f), t : HF64 };
+			case CString(s):
+				return { v : VString(s, null), t : t_string };
+			}
+		case EIdent(i):
+			var v = evalPath([i]);
+			if( v == null ) throw "Unknown identifier "+i;
+			return v;
+		case EArray(v, i):
+			var v = evalExpr(v);
+			var i = evalExpr(i);
+			switch( v.v ) {
+			case VArray(t, len, read, _):
+				var i = toInt(i);
+				return i < 0 || i >= len ? { v : VUndef, t : t } : read(i);
+			case VBytes(len, read, _):
+				var i = toInt(i);
+				return i < 0 || (len >= 0 && i >= len) ? { v : VUndef, t : HUi8 } : { v : VInt(read(i)), t : HUi8 };
+			default:
+			}
+			throw "Can't access " + valueStr(v) + "[" + valueStr(i) + "]";
+		case EArrayDecl(vl):
+			var vl = [for( v in vl ) evalExpr(v)];
+			return { v : VArray(HDyn, vl.length, function(i) return vl[i], null), t : HDyn };
+		case EBinop(op, e1, e2):
+			switch( op ) {
+			case "&&":
+				return mkBool(toBool(evalExpr(e1)) && toBool(evalExpr(e2)));
+			case "||":
+				return mkBool(toBool(evalExpr(e1)) || toBool(evalExpr(e2)));
+			default:
+				return evalBinop(op, evalExpr(e1), evalExpr(e2));
+			}
+		case EBlock(el):
+			var v : Value = { v : VNull, t : HDyn };
+			switch(el) {
+			case [EVar(id,_,e), ETernary(EBinop("==",EIdent(id2),EIdent("null")), EIdent("null"), EField(EIdent(id3),f))] if( id == id2 && id == id3 ):
+				// Special case for e?.field
+				var ve : Value = evalExpr(e);
+				if( compare(ve, v) != 0 ) {
+					v = readField(ve, f);
+					if( v == null ) throw valueStr(ve)+" has no field "+f;
+				}
+			default:
+				for( e in el )
+					v = evalExpr(e);
+			}
+			return v;
+		case EField(e, f):
+			var e = e;
+			var path = [f];
+			var v = null;
+			while( true ) {
+				switch( e ) {
+				case EIdent(i):
+					path.unshift(i);
+					var noFilePath = path.copy();
+					v = evalPath(path);
+					if( v == null ) {
+						// First not lower case id might be file name (removed in runtime)
+						for( i in 0...noFilePath.length-1 ) {
+							if( noFilePath[i].toLowerCase() != noFilePath[i] ) {
+								noFilePath.remove(noFilePath[i]);
+								// Only evaluate if different than path
+								v = evalPath(noFilePath);
+								break;
+							}
+						}
+					}
+					if( v == null )
+						throw "Unknown value "+path.join(".");
+					return v;
+				case EField(e2, f):
+					path.unshift(f);
+					e = e2;
+				default:
+					v = evalExpr(e);
+					for( f in path ) {
+						var vf = readField(v, f);
+						if( vf == null ) throw valueStr(v)+" has no field "+f;
+						v = vf;
+					}
+					return v;
+				}
+			}
+		case EIf(econd, e1, e2), ETernary(econd, e1, e2):
+			if( toBool(evalExpr(econd)) )
+				return evalExpr(e1);
+			return e2 == null ? { v : VNull, t : HDyn } : evalExpr(e2);
+		case EParent(e):
+			return evalExpr(e);
+		case EThrow(e):
+			throw valueStr(evalExpr(e));
+		case EUnop(op, prefix, e):
+			return evalUnop(op, prefix, evalExpr(e));
+		case EMeta(_, _, e):
+			return evalExpr(e);
+		case ECall(efun, eargs):
+			var vargs = [for( e in eargs ) evalExpr(e)];
+			var vfun = evalExpr(efun);
+			switch( vfun.v ) {
+			case VEnum(c, values, p) if( values.length == vargs.length ):
+				return { v : VEnum(c, vargs, p), t : vfun.t };
+			case VMethod(_, obj, _):
+				vargs.unshift(obj);
+			case VFunction(_):
+			default:
+				throw hscript.Printer.toString(e)+" is not a function";
+			}
+			var ft = switch( vfun.t ) {
+			case HFun(ft): ft;
+			default: throw "assert";
+			}
+			for( i => v in vargs ) {
+				var at = ft.args[i];
+				if( at == null )
+					throw "Too many arguments";
+				vargs[i] = castTo(v,at);
+			}
+			while( vargs.length < ft.args.length ) {
+				var at = ft.args[vargs.length];
+				if( at.isPtr() )
+					vargs.push({ v : VNull, t : at });
+				else
+					throw "Missing argument";
+			}
+			if( Debugger.DEBUG || printEvalCall )
+				trace("EVAL "+hscript.Printer.toString(e));
+			return evalCall(vfun, vargs);
+		default:
+			throw "Unsupported expression `" + hscript.Printer.toString(e) + "`";
+		}
+	}
+
+	inline function isFloat(t:HLType) {
+		return t == HF32 || t == HF64;
+	}
+
+	function evalCall( vfun : Value, vargs : Array<Value> ) {
+		if( !jit.is64 )
+			throw "Can't call function in x32 mode : not implemented";
+		var tret = switch( vfun.t ) {
+		case HFun(f), HMethod(f): f.ret;
+		default: throw "Not a function";
+		}
+		var addr = switch( vfun.v ) {
+		case VFunction(_, p), VClosure(_,_,p): readPointer(p.offset(align.ptr));
+		case VMethod(_, _, p): p;
+		default: throw "Not a function";
+		}
+		var eax = hld.Api.Register.makeCpu(0);
+		var prevEax = api.readRegister(currentThread, eax);
+		var eip = api.readRegister(currentThread, Eip);
+		var prevEsp = api.readRegister(currentThread, Esp);
+		// set registers
+		var asmOut = new haxe.io.BytesBuffer();
+
+		function pushReg(r:NativeReg) {
+			if( r.isFpu() ) {
+				asmOut.addInt32(0x10EC8348); // sub rsp, 16
+				// movsd [rsp], xmm?
+				asmOut.addByte(0xF2);
+				asmOut.addByte(0x0F);
+				asmOut.addByte(0x11);
+				asmOut.addByte(0x04 + (r.toInt() & 7) * 8);
+				asmOut.addByte(0x24);
+				return;
+			}
+			if( r.is64() ) asmOut.addByte(0x41);
+			asmOut.addByte(0x50 + (r.toInt()&7));
+		}
+
+		function popReg(r:NativeReg) {
+			if( r.isFpu() ) {
+				// movsd xmm?, [rsp]
+				asmOut.addByte(0xF2);
+				asmOut.addByte(0x0F);
+				asmOut.addByte(0x10);
+				asmOut.addByte(0x04 + (r.toInt() & 7) * 8);
+				asmOut.addByte(0x24);
+				// add rsp, 16
+				asmOut.addInt32(0x10C48348); // add rsp, 16
+				return;
+			}
+			if( r.is64() ) asmOut.addByte(0x41);
+			asmOut.addByte(0x58 + (r.toInt()&7));
+		}
+
+		function setReg(r:NativeReg, ptr:Pointer) {
+			if( r.isFpu() ) {
+				setReg(Eax, ptr);
+				pushReg(Eax);
+				popReg(r);
+				return;
+			}
+			var r64 = 8;
+			if( r.is64() ) r64 |= 1;
+			asmOut.addByte(0x40 | r64);
+			asmOut.addByte(0xB8 + (r.toInt()&7));
+			asmOut.addInt64(ptr.i64);
+		}
+
+		var nextCpu = 0, nextFpu = 0;
+		// Save all SCRATCH_REGS because we might be in the middle of a function
+		var callRegs = jit.isWinCall ? [Ecx, Edx, R8, R9, R10, R11] : [Edi, Esi, Edx, Ecx, R8, R9, R10, R11];
+		for( i => r in callRegs ) {
+			pushReg(r);
+			pushReg(NativeReg.XMM(i));
+		}
+		var regs = [];
+		for( v in vargs ) {
+			var isCpu = !isFloat(v.t);
+			var r : Null<NativeReg> = if( isCpu )
+				callRegs[nextCpu++]
+			else if( jit.isWinCall )
+				nextCpu >= callRegs.length ? null : NativeReg.XMM(nextCpu++)
+			else
+				nextFpu >= callRegs.length ? null : NativeReg.XMM(nextFpu++);
+			if( r == null )
+				throw "TODO : stack arguments";
+			regs.push(r);
+		}
+
+		for( i in 0...vargs.length ) {
+			var v = vargs[vargs.length - i - 1];
+			var r = regs[vargs.length - i - 1];
+			switch( [v.t, v.v] ) {
+			case [HI32, VInt(i)]:
+				setReg(r, Pointer.make(i,0));
+			case [HBool, VBool(b)]:
+				setReg(r, Pointer.make(b?1:0,0));
+			case [HF32, VFloat(f)]:
+				var v = haxe.io.FPHelper.floatToI32(f);
+				setReg(r, Pointer.make(v,0));
+			case [HF64, VFloat(f)]:
+				var v = haxe.io.FPHelper.doubleToI64(f);
+				setReg(r, Pointer.make(v.low, v.high));
+			case _ if( v.t.isPtr() ):
+				var ptr = getPtr(v);
+				if( ptr == null ) {
+					var msg = "Unsupported arg "+valueStr(v)+":"+typeStr(v.t);
+					msg += v.v.match(VString(_)) ? " literal" : " null pointer";
+					throw msg;
+				}
+				setReg(r, ptr);
+			default:
+				throw "Unsupported arg "+valueStr(v)+":"+typeStr(v.t);
+			}
+		}
+		// insert call asm
+		setReg(Eax, addr);
+		asmOut.addByte(0xFF); // call eax
+		asmOut.addByte(0xD0);
+		switch( tret ) {
+		case HF32:
+			asmOut.addInt32(0x10EC8348); // sub rsp, 16
+			// movss [rsp], xmm0
+			asmOut.addInt32(0x04110FF3);
+			asmOut.addByte(0x24);
+			popReg(Eax);
+			asmOut.addInt32(0x08C48348); // add rsp, 8
+		case HF64:
+			asmOut.addInt32(0x10EC8348); // sub rsp, 16
+			// movsd [rsp], xmm0
+			asmOut.addInt32(0x04110FF2);
+			asmOut.addByte(0x24);
+			popReg(Eax);
+			asmOut.addInt32(0x08C48348); // add rsp, 8
+		default:
+			// use RAX
+		}
+		for( i in 0...callRegs.length ) {
+			var i = callRegs.length - 1 - i;
+			popReg(NativeReg.XMM(i));
+			popReg(callRegs[i]);
+		}
+		asmOut.addByte(0xCC); // break
+		// patch the code
+		var asmOut = asmOut.getBytes();
+		var asmSize = asmOut.length;
+		if( Debugger.DEBUG )
+			trace("ASM Eval code ["+asmSize+"] = "+asmOut.toHex());
+		var prevAsm = new Buffer(asmSize);
+		if( !api.read(eip, prevAsm, asmSize) )
+			throw "assert";
+		var buffer = new Buffer(asmSize);
+		for( i in 0...asmSize )
+			buffer.setUI8(i, asmOut.get(i));
+		if( !api.write(eip, buffer, asmSize) )
+			throw "assert";
+		api.flush(eip, asmSize);
+		var isSingleStep = (api.readRegister(currentThread, EFlags).toInt() & 256) == 256;
+		if( isSingleStep )
+			setSingleStep(currentThread, false);
+		// align stack
+		var stackValue = prevEsp;
+		stackValue = stackValue.offset(-0xFF);
+		stackValue = stackValue.offset((-stackValue.toInt() & 0xFF));
+		api.writeRegister(currentThread, Esp, stackValue);
+		// run
+		resumeDebug();
+		if( isSingleStep )
+			setSingleStep(currentThread, true);
+		// restore
+		api.write(eip, prevAsm, asmSize);
+		api.flush(eip, asmSize);
+		var ptr = api.readRegister(currentThread, eax);
+		var nip = api.readRegister(currentThread, Eip).sub(eip);
+		api.writeRegister(currentThread, eax, prevEax);
+		api.writeRegister(currentThread, Eip, eip);
+		api.writeRegister(currentThread, Esp, prevEsp);
+		var hasError = nip != asmSize;
+		if( hasError ) {
+			if( Debugger.DEBUG || printEvalCall )
+				trace("EVAL Exception has occured");
+			throw "Exception has occured";
+		}
+		return convertVal(ptr, tret);
+	}
+
+	public dynamic function resumeDebug() {
+		throw "Not implemented";
+	}
+
+	public dynamic function setSingleStep(tid : Int, set : Bool) {
+		throw "Not implemented";
+	}
+
+	function getNum( v : Value ) : Float {
+		return switch( v.v ) {
+		case VInt(i): i;
+		case VFloat(f): f;
+		default: throw valueStr(v)+" should be a number";
+		}
+	}
+
+	function getInt( v : Value ) : Int {
+		return switch( v.v ) {
+		case VInt(i): i;
+		default: throw valueStr(v)+" should be a number";
+		}
+	}
+
+	function getInt64( v : Value ) : haxe.Int64 {
+		return switch( v.v ) {
+		case VInt64(i): i;
+		case VInt(i): i;
+		default: throw valueStr(v)+" should be a number";
+		}
+	}
+
+	function compare(a:Value,b:Value) : Int {
+		switch [a.v, b.v] {
+		case [VInt(_) | VFloat(_), VInt(_) | VFloat(_)]:
+			var d = getNum(a) - getNum(b);
+			return d == 0 ? 0 : d > 0 ? 1 : -1;
+		case [VInt(_) | VInt64(_), VInt(_) | VInt64(_)]:
+			var d = getInt64(a) - getInt64(b);
+			return d == 0 ? 0 : d > 0 ? 1 : -1;
+		case [VBool(ab), VBool((bb))]:
+			return ab == bb ? 0 : ab ? 1 : -1;
+		case [VPointer(_) | VNull, VPointer(_) | VNull]:
+			return getPtr(a).sub(getPtr(b));
+		case [VString(as,_), VString(bs,_)]:
+			return Reflect.compare(as, bs);
+		case [VString(_,_) | VNull, VString(_,_) | VNull]:
+			return b.v == VNull ? 1 : -1;
+		case [VEnum(ac, avalues, _), VEnum(bc, bvalues, _)]:
+			switch [a.t, b.t] {
+			case [HEnum(aproto), HEnum(bproto)] if( aproto == bproto ):
+				if( ac == bc && avalues.length == bvalues.length ) {
+					for( i in 0...avalues.length )
+						if( compare(avalues[i], bvalues[i]) != 0 )
+							return -1;
+					return 0;
+				}
+				for( c in aproto.constructs ) {
+					if( c.name == ac ) return -1;
+					if( c.name == bc ) return 1;
+				}
+			default:
+			}
+			return -1;
+		default:
+			throw "Don't know how to compare " + a.v.getName() + " and " + b.v.getName();
+		}
+	}
+
+	function mkBool(b) : Value {
+		return { v : VBool(b), t : HBool };
+	}
+
+	function evalBinop(op, v1:Value, v2:Value) : Value {
+		inline function numOp(f:Float->Float->Float) : Value {
+			var f1 = getNum(v1);
+			var f2 = getNum(v2);
+			var ret = f(f1,f2);
+			var iret = Std.int(ret);
+			return iret == ret ? { v : VInt(iret), t : HI32 } : { v : VFloat(ret), t : HF64 };
+		}
+		inline function iop(f:Int->Int->Int) : Value {
+			var f1 = getInt(v1);
+			var f2 = getInt(v2);
+			var ret = f(f1,f2);
+			return { v : VInt(ret), t : HI32 };
+		}
+		return switch( op ) {
+		case "+": numOp((a,b)->a+b);
+		case "-": numOp((a,b)->a-b);
+		case "*": numOp((a,b)->a*b);
+		case "/": numOp((a,b)->a/b);
+		case "%": numOp((a,b)->a%b);
+		case ">>": iop((a,b)->a>>b);
+		case ">>>": iop((a,b)->a>>>b);
+		case "<<": iop((a,b)->a<<b);
+		case "|": iop((a,b)->a|b);
+		case "&": iop((a,b)->a&b);
+		case "^": iop((a,b)->a^b);
+		case "==": mkBool(compare(v1,v2) == 0);
+		case "!=": mkBool(compare(v1,v2) != 0);
+		case ">": mkBool(compare(v1,v2) > 0);
+		case "<": mkBool(compare(v1,v2) < 0);
+		case ">=": mkBool(compare(v1,v2) >= 0);
+		case "<=": mkBool(compare(v1,v2) <= 0);
+		default:
+			throw "Can't eval " + valueStr(v1) + " " + op + " " + valueStr(v2);
+		}
+	}
+
+	function evalUnop(op, prefix:Bool, v:Value) : Value {
+		return switch( op ) {
+		case "-":
+			switch( v.v ) {
+			case VInt(i): { v : VInt(-i), t : v.t };
+			case VFloat(f): { v : VFloat(-f), t : v.t };
+			default: getNum(v); throw "assert";
+			}
+		case "!":
+			switch( v.v ) {
+			case VBool(b): mkBool(!b);
+			case VNull: mkBool(true);
+			default: throw "Can't do !"+valueStr(v);
+			}
+		default:
+			throw "Can't eval " + (prefix ? op + valueStr(v) : valueStr(v) + op);
+		}
+	}
+
+	function defVal( t : HLType ) : Value {
+		return switch( t ) {
+		case HUi8, HUi16, HI32, HI64: { v : VInt(0), t : t };
+		case HF32, HF64: { v : VFloat(0.), t : t };
+		case HBool: { v : VBool(false), t : t };
+		default: { v : VNull, t : t };
+		}
+	}
+
+	function toInt( v : Value ) : Int {
+		switch( v.v ) {
+		case VNull, VUndef:
+			return 0;
+		case VInt(i):
+			return i;
+		case VFloat(f):
+			return Std.int(f);
+		default:
+			throw "Can't cast " + valueStr(v) + " to int";
+		}
+	}
+
+	function toBool( v : Value ) : Bool {
+		switch( v.v ) {
+		case VNull, VUndef:
+			return false;
+		case VBool(b):
+			return b;
+		default:
+			throw "Can't cast " + valueStr(v) + " to bool";
+		}
+	}
+
+	function getVar( name : String ) : Value {
+		return switch( name ) {
+		case "true": mkBool(true);
+		case "false": mkBool(false);
+		case "null": { v : VNull, t : HDyn };
+		case "$ret":
+			var t = module.getGraph(funIndex).getReturnReg(codePos);
+			if( t == null )
+				return null;
+			return convertVal(api.readRegister(currentThread,t == HF64 || t == HF32 ? hld.Api.Register.makeFpu(0) : hld.Api.Register.makeCpu(0)), t);
+		default:
+			fetchAddr(getVarAddress(name));
+		}
+	}
+
+	function getVarAddress( name : String, ?prefix : String, ?localsRaw : Array<String>, localOnly = false ) : VarAddress {
+		var fullname = prefix == null ? name : prefix + "." + name;
+		var a = getVarAddressRaw(fullname, localOnly);
+		if( a != ANone )
+			return a;
+
+		if( localsRaw == null ) {
+			var g = module.getGraph(funIndex);
+			@:privateAccess localsRaw = g.getLocalsRaw(codePos).concat(g.getArgsRaw());
+		}
+
+		// Inlined constructor variables
+		var relatedLocals = [];
+		for( r in localsRaw ) {
+			var names = r.split(".");
+			if( names.length <= 1 || names[0] != name ) continue;
+			relatedLocals.push(r.substr(name.length+1));
+		}
+		if( relatedLocals.length == 0 )
+			return ANone;
+
+		var fnames = [];
+		for( r in relatedLocals ) {
+			var name = r.split(".")[0];
+			if( fnames.contains(name) ) continue;
+			fnames.push(name);
+		}
+		var fields = [for( n in fnames ) { name : n, addr : getVarAddress(n, fullname, relatedLocals, true) }];
+		return AInlined(fields);
+	}
+
+	function getVarAddressRaw( name : String, localOnly : Bool ) : VarAddress {
+		// locals
+		var loc = module.getGraph(funIndex).getLocal(name, codePos);
+		if( loc != null && !globalContext ) {
+			var v = readRegAddress(loc.rid, loc);
+			if( loc.index != null ) {
+				switch( v ) {
+				case AUndef(_):
+					return AUndef(loc.t);
+				case AOverwritten(_):
+					return AOverwritten(loc.t);
+				case AAddr(ptr, t):
+					var ptr = readPointer(ptr);
+					return AAddr(ptr.offset(module.getEnumProto(loc.container)[0].params[loc.index].offset), loc.t);
+				case ANative(r, t):
+					var ptr = readNatReg(r);
+					return AAddr(ptr.offset(module.getEnumProto(loc.container)[0].params[loc.index].offset), loc.t);
+				default:
+					throw "assert";
+				}
+			}
+			return v;
+		}
+		if( localOnly )
+			return ANone;
+
+		// register
+		if( ~/^\$[0-9]+$/.match(name) )
+			return readRegAddress(Std.parseInt(name.substr(1)));
+
+		// this variable
+		if( module.getGraph(funIndex).getLocal("this", codePos) != null && !globalContext ) {
+			var vthis = getVar("this");
+			if( vthis != null ) {
+				var f = readFieldAddress(vthis, name);
+				if( f != ANone )
+					return f;
+				// static var
+				switch( vthis.t ) {
+				case HObj(o) if( o.globalValue != null ):
+					var path = o.name.split(".");
+					path.push(name);
+					var f = getGlobalAddress(path);
+					if( f != ANone )
+						return f;
+				default:
+				}
+			}
+		}
+
+		// static
+		var ctx = module.getMethodContext(funIndex);
+		var tpack = null;
+		if( ctx != null && !globalContext ) {
+			var t = ctx.obj;
+			if( t.globalValue != null )
+				t = switch( module.code.globals[t.globalValue] ) {
+				case HObj(p): p;
+				default: null;
+				}
+			if( t != null ) {
+				var path = t.name.split(".");
+				var tname = path.pop();
+				if( tname.charCodeAt(0) == '$'.code ) {
+					path.push(tname.substr(1));
+					for( f in t.fields )
+						if( f.name == name ) {
+							path.push(name);
+							return getGlobalAddress(path);
+						}
+					path.pop();
+					tpack = path;
+				}
+			}
+		}
+
+		// global
+		var g = getGlobalAddress([name]);
+		if( g != ANone )
+			return g;
+
+		// global (current package)
+		if( tpack != null && tpack.length > 0 ) {
+			tpack.push(name);
+			var g = getGlobalAddress(tpack);
+			if( g != ANone )
+				return g;
+		}
+
+		return ANone;
+	}
+
+	function evalPath( path : Array<String> ) : Value {
+		var v = getVar(path[0]);
+		if( v != null ) {
+			path.shift();
+			var p : String = null;
+			while( v != null && path.length > 0 ) {
+				p = path.shift();
+				v = readField(v, p);
+			}
+			if( v == null )
+				path.unshift(p);
+		} else {
+			if( path[0] == "std" )
+				path.shift();
+			v = fetchAddr(getGlobalAddress(path));
+		}
+		return v;
+	}
+
+	function getGlobalAddress( path : Array<String> ) : VarAddress {
+		var g = module.resolveGlobal(path);
+		if( g == null )
+			return ANone;
+		var addr = AAddr(jit.globals.offset(g.offset), g.type);
+		var p : String = null;
+		while( addr != ANone && path.length > 0 ) {
+			p = path.shift();
+			addr = readFieldAddress(fetchAddr(addr), p);
+		}
+		if( addr == ANone && p != null )
+			path.unshift(p);
+		return addr;
+	}
+
+	function escape( s : String ) {
+		s = s.split("\\").join("\\\\");
+		s = s.split("\n").join("\\n");
+		s = s.split("\r").join("\\r");
+		s = s.split("\t").join("\\t");
+		s = s.split('"').join('\\"');
+		return s;
+	}
+
+	public function typeStr( t : HLType, depth = 0 ) {
+		switch( t ) {
+		case HVirtual(fields) if( fields.length > 0 && depth < 3 ):
+			return "{ " + [for( f in fields ) f.name + " : " + typeStr(f.t, depth + 1)].join(", ") + " }";
+		case HDynObj, HVirtual(_):
+			return "{...}";
+		case HAbstract(name):
+			return "#"+name;
+		case HNull(t):
+			return typeStr(t);
+		default:
+			var s = t.toString();
+			return s == null || s == "" ? "<" + Type.enumConstructor(t) + ">" : s;
+		}
+	}
+
+	public function valueStr( v : Value, maxStringRec = 3 ) {
+		if( maxStringRec < 0 && v.t.isPtr() )
+			return "<...>";
+		maxStringRec--;
+		var str = switch( v.v ) {
+		case VUndef: "undef"; // null read / outside bounds
+		case VOverwritten: "overwritten";
+		case VNull: "null";
+		case VInt(i):
+			switch( v.hint ) {
+			case HHex: Value.intStr(i, 16);
+			case HBin: Value.intStr(i, 2);
+			case HGuid: Value.int64GuidStr(i);
+			case HEnumFlags(t):
+				var eproto = module.resolveEnum(t);
+				if( eproto == null )
+					throw "Can't resolve enum " + t;
+				Value.intEnumFlags(i, eproto);
+			case HEnumIndex(t):
+				var eproto = module.resolveEnum(t);
+				if( eproto == null )
+					throw "Can't resolve enum " + t;
+				Value.intEnumIndex(i, eproto);
+			case HCdbEnum(t):
+				var enames = eval(t + ".NAMES");
+				if( enames == null )
+					throw "Can't resolve CDB " + t + ".NAMES";
+				switch( enames.v ) {
+				case VArray(_, _, read, _):
+					valueStr(read(i));
+				default:
+					throw "Can't resolve CDB " + t + ".NAMES array";
+				}
+			default: "" + i;
+			}
+		case VInt64(i):
+			switch( v.hint ) {
+			case HBin: Value.int64Str(i, 2);
+			case HHex: Value.int64Str(i, 16);
+			case HGuid: Value.int64GuidStr(i);
+			default: "" + i;
+			}
+		case VFloat(i):
+			switch( v.hint ) {
+			case HHex:
+				var i64 = haxe.Int64.fromFloat(i);
+				var is32 = i64.high == (i64.low >> 31);
+				is32 ? Value.intStr(i64.low, 16) : Value.int64Str(i64, 16);
+			case HBin:
+				var i64 = haxe.Int64.fromFloat(i);
+				var is32 = i64.high == (i64.low >> 31);
+				is32 ? Value.intStr(i64.low, 2) : Value.int64Str(i64, 2);
+			case HGuid:
+				var i64 = haxe.Int64.fromFloat(i);
+				Value.int64GuidStr(i64);
+			default: "" + i;
+			}
+		case VBool(b): b ? "true" : "false";
+		case VPointer(_):
+			switch( v.t ) {
+			case HObj(p), HStruct(p): p.name.split(".").pop(); // short form (no package)
+			default: typeStr(v.t);
+			}
+		case VString(s,_):
+			switch( v.hint ) {
+			case HNoEscape:
+				"\"" + s + "\"";
+			default:
+				"\"" + escape(s) + "\"";
+			}
+		case VClosure(f, d, _), VMethod(f, d, _): funStr(f, v.hint == HPointer) + "[" + valueStr(d,maxStringRec) + "]";
+		case VFunction(f,_): funStr(f, v.hint == HPointer);
+		case VArray(_, length, read, _):
+			var hasDispValue = false;
+			for( i in 0...length ) {
+				var v = read(i);
+				if( !v.t.match(HDynObj | HVirtual(_)) ) {
+					hasDispValue = true;
+					break;
+				}
+			}
+			if( !hasDispValue && length > 0 )
+				"[...]"+(length > maxArrLength ? ":" + length : "");
+			else if( length <= maxArrLength )
+				"["+[for(i in 0...length) valueStr(read(i),maxStringRec)].join(", ")+"]";
+			else {
+				var arr = [for(i in 0...maxArrLength) valueStr(read(i),maxStringRec)];
+				arr.push("...");
+				"["+arr.join(",")+"]:"+length;
+			}
+		case VBytes(length, read, _):
+			switch( v.hint ) {
+			case HReadBytes(t, pos):
+				var pos = toInt(eval(pos));
+				valueStr(readBytesAt(length, read, t, pos));
+			default:
+				var blen = length < 0 ? maxUnknownBytesLength : (length < maxBytesLength ? length : maxBytesLength);
+				var bytes = haxe.io.Bytes.alloc(blen);
+				var count = 0;
+				while( count < blen ) {
+					var b : Null<Int> = if( length < 0 && count > 0 ) try read(count) catch( e : Dynamic ) null else read(count);
+					if( b == null ) break;
+					bytes.set(count, b);
+					count++;
+				}
+				var hex = bytes.sub(0,count).toHex().toUpperCase();
+				if( length < 0 )
+					"0x" + hex + "...";
+				else
+					length + ":0x" + hex + (length > maxBytesLength ? "..." : "");
+			}
+		case VMap(_, 0, _):
+			"{}";
+		case VMap(_, nkeys, readKey, readValue, _):
+			var max = nkeys < maxArrLength ? nkeys : maxArrLength;
+			var content = [for( i in 0...max ) { var k = readKey(i); valueStr(k,maxStringRec) + "=>" + valueStr(readValue(i),maxStringRec); }];
+			if( max != nkeys ) {
+				content.push("...");
+				content.toString() + ":" + nkeys;
+			} else
+				content.toString();
+		case VMapPair(key, value):
+			valueStr(key, maxStringRec) + "=>" + valueStr(value, maxStringRec);
+		case VType(t):
+			typeStr(t);
+		case VEnum(c, values, _):
+			if( values.length == 0 )
+				c
+			else
+				c + "(" + [for( v in values ) valueStr(v,maxStringRec)].join(", ") + ")";
+		case VInlined(fields):
+			"{ " + [for( f in fields ) f.name + " : " + valueStr(fetchAddr(f.addr), maxStringRec)].join(", ") + " }";
+		case VGuid(i, name):
+			switch( v.hint ) {
+			case HBin: Value.int64Str(i, 2);
+			case HHex: Value.int64Str(i, 16);
+			default:
+				var str = Value.int64GuidStr(i);
+				if( name != null )
+					str = '$name ($str)';
+				str;
+			}
+		}
+		return str;
+	}
+
+	function readBytesAt( length : Int , read : Int->Int, t : HLType, pos : Int) : Value {
+		var blen = align.typeSize(t);
+		if( pos < 0 || (length >= 0 && pos > length-blen) )
+			throw "Out of bound [0," + (length < 0 ? "???" : "" + length) + ") for " + pos + "+" + (blen - 1);
+		var bytes = haxe.io.Bytes.alloc(blen);
+		for( i in 0...blen )
+			bytes.set(i, read(pos+i));
+		return switch( t ) {
+		case HUi8: { v : VInt(bytes.get(0)), t : t };
+		case HUi16: { v : VInt(bytes.getUInt16(0)), t : t };
+		case HI32: { v : VInt(bytes.getInt32(0)), t : t };
+		case HI64: { v : VInt64(bytes.getInt64(0)), t : t };
+		case HF32: { v : VFloat(bytes.getFloat(0)), t : t };
+		case HF64: { v : VFloat(bytes.getDouble(0)), t : t };
+		default:
+			throw "assert";
+		}
+	}
+
+	public function funStr( f : FunRepr, withAddr : Bool ) {
+		return switch( f ) {
+		case FUnknown(p): "fun(" + p.toString() + ")";
+		case FIndex(i, p): "fun(" + getFunctionName(i) + ( withAddr ? "@" + p.toString() : "") + ")";
+		}
+	}
+
+	function getFunctionName( idx : Int ) {
+		var s = module.resolveSymbol(idx, 0);
+		return s.file+":" + s.line;
+	}
+
+	function decodeNativeReg( reg : Int, t : HLType ) {
+		if( reg & 0x40000000 != 0x40000000 )
+			return AUndef(t);
+		var r = reg & 0x7F;
+		if( r >= 0x40 )
+			return ANative(NativeReg.XMM(r-0x40), t);
+		if( reg & 0x10000000 != 0 ) {
+			if( r != 5 ) // RBP offset
+				return AUndef(t);
+			var offset = (reg < 0 ? (reg | 0xF0000000) : (reg & 0x0FFFFFFF)) >> 7;
+			return AAddr(ebp.offset(offset), t);
+		}
+		return ANative(cast r,t);
+	}
+
+	function nativeRegIndex( reg : Int ) : Int {
+		return switch( decodeNativeReg(reg, HDyn) ) {
+		case ANative(r, _): r.toInt();
+		default: -1;
+		}
+	}
+
+	function getOpOffsets( fidx : Int ) : Array<Int> {
+		if( opOffsets == null ) opOffsets = new Map();
+		var offs = opOffsets.get(fidx);
+		if( offs != null )
+			return offs;
+		var start = jit.getFunctionPos(fidx);
+		offs = [for( i in 0...module.code.functions[fidx].ops.length ) jit.getCodePos(fidx, i).sub(start)];
+		opOffsets.set(fidx, offs);
+		return offs;
+	}
+
+	function getRecordBlock( fidx : Int, start : Int ) : Int {
+		var offs = getOpOffsets(fidx);
+		var starts = module.getGraph(fidx).getBlockStarts();
+		var min = 0, max = starts.length;
+		while( min < max ) {
+			var mid = (min + max) >> 1;
+			if( offs[starts[mid]] <= start + 1 ) min = mid + 1 else max = mid;
+		}
+		return starts[min == 0 ? 0 : min - 1];
+	}
+
+	function getRegOverwritePos( recs : Array<VarRecord>, index : Int, until : Int ) : Int {
+		var rec = recs[index];
+		var nreg = nativeRegIndex(rec.reg);
+		if( nreg < 0 )
+			return -1; // stack slots are not shared between variables
+		var pos = -1;
+		for( o in recs ) {
+			if( o.id == rec.id || nativeRegIndex(o.reg) != nreg )
+				continue;
+			if( o.start > rec.start && o.start <= until && (pos < 0 || o.start < pos) )
+				pos = o.start;
+		}
+		return pos;
+	}
+
+	function readRegAddress( index : Int, ?loc : CodeGraph.LocalAccess ) : VarAddress {
+		var r = module.getFunctionRegs(funIndex)[index];
+		if( r == null )
+			return ANone;
+		if( !module.getGraph(funIndex).isRegisterWritten(index, codePos) )
+			return AUndef(r.t);
+		if( jit.hlVersion >= 2 ) {
+			if( loc == null )
+				return AUndef(r.t);
+			var recs = getVarRecords(funIndex);
+			var funPos = nativeCodePos - jit.getNativeCodePos(jit.getFunctionPos(funIndex));
+			// an id has one record per assign and merge, all valid until the end of the scope :
+			// the live one is the one that starts last before us, among those whose block
+			// dominates us - a merge only holds the value on the paths reaching its join
+			var graph = module.getGraph(funIndex);
+			var found = -1;
+			for( i in 0...recs.length ) {
+				var rec = recs[i];
+				if( rec.id != loc.vid )
+					continue;
+				if( funPos < rec.start || funPos >= rec.end )
+					continue;
+				if( !graph.dominates(getRecordBlock(funIndex, rec.start), codePos) )
+					continue;
+				if( found < 0 || rec.start > recs[found].start )
+					found = i;
+			}
+			if( found < 0 )
+				return AUndef(r.t);
+			if( getRegOverwritePos(recs, found, funPos) >= 0 )
+				return AOverwritten(r.t);
+			return switch( decodeNativeReg(recs[found].reg, r.t) ) {
+			case ANative(nreg, t): readNativeRegAddress(nreg, t);
+			case a: a;
+			}
+		}
+		return AAddr(ebp.offset(r.offset), r.t);
+	}
+
+	static var CPU_NAMES = ["rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"];
+
+	public function nativeRegName( r : NativeReg ) : String {
+		var i = r.toInt();
+		if( i >= 16 )
+			return "xmm" + (i - 16);
+		var n = CPU_NAMES[i];
+		return n == null ? "reg" + i : n;
+	}
+
+	function hexOffset( v : Int ) {
+		return (v < 0 ? "-0x" : "+0x") + StringTools.hex(v < 0 ? -v : v);
+	}
+
+	function nativeLocStr( reg : Int ) : String {
+		return switch( decodeNativeReg(reg, HDyn) ) {
+		case ANative(r, _):
+			nativeRegName(r);
+		case AAddr(ptr, _):
+			"[" + nativeRegName(Ebp) + hexOffset(ptr.sub(ebp)) + "]";
+		default:
+			"<undefined>";
+		}
+	}
+
+	function varIdStr( f : format.hl.Data.HLFunction, id : Int ) {
+		var nargs = switch( f.t ) { case HFun(ft): ft.args.length; default: 0; };
+		var names = [];
+		if( f.assigns != null ) {
+			if( id < nargs ) {
+				var args = [for( a in f.assigns ) if( a.position == -1 ) a.varName];
+				var index = id - (nargs - args.length);
+				if( index >= 0 && index < args.length ) names.push(module.code.strings[args[index]]);
+			} else
+				for( a in f.assigns )
+					if( a.position == id - nargs ) names.push(module.code.strings[a.varName]);
+		}
+		var name = names.length == 0 ? "?" : names.join("|");
+		return id < nargs ? 'arg$id "$name"' : '"$name" @op ${id - nargs}';
+	}
+
+	public function getContextStr() {
+		var f = module.code.functions[funIndex];
+		var s = module.resolveSymbol(funIndex, codePos);
+		return 'fun@${f.findex} ${s.file}:${s.line} (fidx=$funIndex, op=$codePos)';
+	}
+
+	public function getHLRegs() : Array<String> {
+		var out = [];
+		var f = module.code.functions[funIndex];
+
+		out.push("-- register types --");
+		for( i in 0...f.regs.length )
+			out.push('R$i : ${typeStr(f.regs[i])}');
+
+		out.push("-- assigns --");
+		if( f.assigns == null || f.assigns.length == 0 )
+			out.push("<none> (module compiled without -D hl-debug ?)");
+		else {
+			var argIndex = 0;
+			for( a in f.assigns ) {
+				var name = module.code.strings[a.varName];
+				if( a.position == -1 )
+					out.push('arg${argIndex++} "$name"');
+				else if( a.position < -1 )
+					out.push('capture "$name" in R${ -a.position - 2 }');
+				else {
+					var op = a.position < f.ops.length ? " " + Std.string(f.ops[a.position]) : " <out of range>";
+					out.push('"$name" @op ${a.position}$op');
+				}
+			}
+		}
+		return out;
+	}
+
+	public function getDebugRegs() : Array<String> {
+		var out = [];
+		var g = module.getGraph(funIndex);
+		var names = @:privateAccess g.getArgsRaw().concat(g.getLocalsRaw(codePos));
+		if( names.length == 0 ) {
+			out.push("<no variable in scope>");
+			return out;
+		}
+		for( n in names ) {
+			var loc = g.getLocal(n, codePos);
+			if( loc == null )
+				out.push('$n = <not resolved>');
+			else
+				out.push('$n = R${loc.rid} (${typeStr(loc.t)})');
+		}
+		return out;
+	}
+
+	public function getNatRegs( ?fidx : Int ) : Array<String> {
+		var out = [];
+		if( fidx == null ) fidx = funIndex;
+		var recs = getVarRecords(fidx);
+		if( recs.length == 0 ) {
+			out.push("<empty>");
+			return out;
+		}
+		var f = module.code.functions[fidx];
+		for( i in 0...recs.length ) {
+			var rec = recs[i];
+			var over = getRegOverwritePos(recs, i, rec.end - 1);
+			var overStr = over < 0 ? "" : ' overwritten @+0x${StringTools.hex(over)}';
+			out.push('${varIdStr(f, rec.id)} [+0x${StringTools.hex(rec.start)},+0x${StringTools.hex(rec.end)}) = ${nativeLocStr(rec.reg)}$overStr');
+		}
+		var saved = getSavedRegs(fidx);
+		if( saved.keys().hasNext() ) {
+			out.push("-- saved registers --");
+			for( r => offset in saved )
+				out.push('${nativeRegName(r)} = [${nativeRegName(Ebp)}${hexOffset(offset)}]');
+		}
+		return out;
+	}
+
+	function convertVal( p : Pointer, t : HLType ) : Value {
+		var v = switch( t ) {
+		case HVoid:
+			VNull;
+		case HUi8, HUi16, HI32:
+			VInt(p.i64.low);
+		case HI64:
+			VInt64(haxe.Int64.make(p.i64.high,p.i64.low));
+		case HF64, HF32:
+			VFloat(haxe.io.FPHelper.i64ToDouble(p.i64.low,p.i64.high));
+		case HBool:
+			VBool(p.toInt() & 0xFF != 0);
+		case HGUID:
+			var i64 = haxe.Int64.make(p.i64.high, p.i64.low);
+			VGuid(i64, getGuidName(i64));
+		default:
+			return valueCast(p, t);
+		};
+		return { v : v, t : t };
+	}
+
+	public function readVal( p : Pointer, t : HLType ) : Value {
+		var v = switch( t ) {
+		case HVoid:
+			VNull;
+		case HUi8:
+			var m = readMem(p, 1);
+			VInt(m.getUI8(0));
+		case HUi16:
+			var m = readMem(p, 2);
+			VInt(m.getUI16(0));
+		case HI32:
+			VInt(readI32(p));
+		case HI64:
+			VInt64(haxe.Int64.make(readI32(p.offset(4)),readI32(p)));
+		case HF32:
+			var m = readMem(p, 4);
+			VFloat(m.getF32(0));
+		case HF64:
+			var m = readMem(p, 8);
+			VFloat(m.getF64(0));
+		case HBool:
+			var m = readMem(p, 1);
+			VBool(m.getUI8(0) != 0);
+		case HPacked(t):
+			return { v : VPointer(p), t : t.v };
+		case HGUID:
+			var i64 = haxe.Int64.make(readI32(p.offset(4)), readI32(p));
+			var name = getGuidName(i64);
+			return { v : VGuid(i64, name), t : t };
+		default:
+			p = readPointer(p);
+			return valueCast(p, t);
+		};
+		return { v : v, t : t };
+	}
+
+	public function readArrayAddress( value : Value, index : Int ) {
+		switch( value.v ) {
+		case VArray(t,len,_,ptr) if( index >= 0 && index < len && ptr != null ):
+			var content = ptr;
+			var offset = align.typeSize(t) * index;
+			if( readType(ptr).match(HArray) ) {
+				offset += sizeofVArray;
+			} else {
+				content = readPointer(ptr.offset(align.ptr * 2));
+				if( t.isPtr() ) offset += sizeofVArray; // ArrayBytes
+			}
+			return AAddr(content.offset(offset),t);
+		default:
+		}
+		return ANone;
+	}
+
+	function valueCast( p : Pointer, t : HLType ) : Value {
+		if( p.isNull() )
+			return { v : VNull, t : t };
+		var v = VPointer(p);
+		switch( t ) {
+		case HObj(o):
+			t = readType(p);
+			switch( t ) {
+			case HObj(o2): o = o2;
+			default:
+			}
+			switch( o.name ) {
+			case "String":
+				var bytes = readPointer(p.offset(align.ptr));
+				var length = readI32(p.offset(align.ptr * 2));
+				var str = readUCS2(bytes, length);
+				v = VString(str, p);
+			case "hl.types.ArrayObj":
+				var length = readI32(p.offset(align.ptr));
+				var nativeArray = readPointer(p.offset(align.ptr * 2));
+				var type = readType(nativeArray.offset(align.ptr));
+				v = VArray(type, length, function(i) return readVal(nativeArray.offset(sizeofVArray + i * align.ptr), type), p);
+			case "hl.types.ArrayBytes_Int":
+				v = makeArrayBytes(p, HI32);
+			case "hl.types.ArrayBytes_Float":
+				v = makeArrayBytes(p, HF64);
+			case "hl.types.ArrayBytes_hl_F32":
+				v = makeArrayBytes(p, HF32);
+			case "hl.types.ArrayBytes_hl_UI16":
+				v = makeArrayBytes(p, HUi16);
+			case "hl.types.ArrayBytes_hl_UI8":
+				v = makeArrayBytes(p, HUi8);
+			case "hl.types.ArrayBytes_hl_I64":
+				v = makeArrayBytes(p, HI64);
+			case "hl.types.ArrayBytes_hl_GUID":
+				v = makeArrayBytes(p, HGUID);
+			case "hl.types.ArrayDyn":
+				// hide implementation details, substitute underlying array
+				v = readField({ v : v, t : t }, "array").v;
+			case "haxe.ds.StringMap":
+				v = makeMap(readPointer(p.offset(align.ptr)), HBytes);
+			case "haxe.ds.IntMap":
+				v = makeMap(readPointer(p.offset(align.ptr)), HI32);
+			case "haxe.ds.ObjectMap":
+				v = makeMap(readPointer(p.offset(align.ptr)), HDyn);
+			case "haxe.io.Bytes":
+				var length = readI32(p.offset(align.ptr));
+				var bytes = readPointer(p.offset(align.ptr * 2));
+				v = VBytes(length, function(i) return readMem(bytes.offset(i),1).getUI8(0), p);
+			default:
+			}
+		case HVirtual(_):
+			var v = readPointer(p.offset(align.ptr));
+			if( !v.isNull() )
+				return valueCast(v, HDyn);
+		case HDyn:
+			t = readType(p);
+			if( t.isDynamic() )
+				return valueCast(p, t);
+			v = readVal(p.offset(8), t).v;
+		case HNull(t):
+			v = readVal(p.offset(8), t).v;
+		case HRef(t):
+			v = readVal(p, t).v;
+		case HFun(_):
+			var funPtr = readPointer(p.offset(align.ptr));
+			var hasValue = readI32(p.offset(align.ptr * 2));
+			var fidx = jit.functionFromAddr(funPtr);
+			var fval = fidx == null ? FUnknown(funPtr) : FIndex(fidx, funPtr);
+			if( hasValue == 1 ) {
+				var value = readVal(p.offset(align.ptr * 3), HDyn);
+				v = VClosure(fval, value, p);
+			} else
+				v = VFunction(fval, p);
+		case HType:
+			v = VType(readType(p,true));
+		case HBytes:
+			v = VBytes(-1, function(i) return readByte(p.offset(i)), p);
+		case HEnum(e):
+			var index = readI32(p.offset(align.ptr));
+			var c = module.getEnumProto(e)[index];
+			v = VEnum(c.name,[for( a in c.params ) readVal(p.offset(a.offset),a.t)], p);
+		case HAbstract("hl_int64_map"):
+			v = makeMap(p, HI64);
+		case HArray:
+			// hl.NativeArray
+			var type = readType(p.offset(align.ptr));
+			var length = readI32(p.offset(align.ptr*2));
+			var size = align.typeSize(type);
+			v = VArray(type, length, function(i) return readVal(p.offset(sizeofVArray + i * size), type), p);
+		default:
+		}
+		return { v : v, t : t };
+	}
+
+	function makeArrayBytes( p : Pointer, t : HLType ) {
+		var length = readI32(p.offset(align.ptr));
+		var bytes = readPointer(p.offset(align.ptr * 2));
+		var size = align.typeSize(t);
+		return VArray(t, length, function(i) return readVal(bytes.offset(i * size), t), p);
+	}
+
+	function makeMap( p : Pointer, tkey : HLType ) {
+		var isV13 = jit.hlVersion >= 1.13;
+		var cells = readPointer(p);
+		var nexts = isV13 ? readPointer(p.offset(align.ptr)) : null;
+		var offset = isV13 ? align.ptr * 2 : align.ptr;
+		var entries = readPointer(p.offset(offset));
+		var values = readPointer(p.offset(offset + align.ptr));
+		var freelist_size = align.ptr + 4 + 4;
+		var pos = offset + align.ptr * 2 + freelist_size;
+		var ncells = readI32(p.offset(pos));
+		var nentries = readI32(p.offset(pos + 4));
+		var maxEntries = readI32(p.offset(pos + 8));
+		var keyInValue;
+		var valuePos, keyStride, valueStride, keyPadding = 0;
+		switch( tkey ) {
+		case HBytes:
+			keyInValue = true;
+			valuePos = align.ptr;
+			keyStride = isV13 ? 4 : 8;
+			valueStride = align.ptr * 2;
+		case HI32:
+			keyInValue = false;
+			valuePos = 0;
+			keyStride = isV13 ? 4 : 8;
+			valueStride = align.ptr;
+		case HDyn:
+			keyInValue = true;
+			valuePos = align.ptr;
+			keyStride = isV13 ? 0 : 4;
+			valueStride = align.ptr * 2;
+		case HI64:
+			keyInValue = false;
+			valuePos = 0;
+			keyStride = isV13 ? 8 : 16;
+			keyPadding = 4;
+			valueStride = align.ptr;
+		default:
+			throw "Unsupported map " + tkey.toString();
+		}
+
+		var isSmall = isV13 && maxEntries < 128;
+
+		var content : Array<{ key : Value, value : Value }> = [];
+		var curCell = 0;
+
+		function fetch(k) {
+			while( content.length <= k ) {
+				if( curCell == ncells ) throw "assert";
+				var c = isSmall ? readByte(cells.offset(curCell++)) : readI32(cells.offset((curCell++) << 2));
+				while( c >= 0 ) {
+					if( isSmall && c == 255 )
+						break;
+					var value = readVal(values.offset(c * valueStride + valuePos), HDyn);
+					var keyPtr = keyInValue ? values.offset(c * valueStride) : entries.offset(c * keyStride);
+					var key : Value = switch( tkey ) {
+					case HBytes:
+						{ v : VString(readUCSBytes(readPointer(keyPtr)), null), t : t_string };
+					case HI32:
+						{ v : VInt(readI32(keyPtr)), t : HI32 };
+					case HI64:
+						{ v : VInt64(readI64(keyPtr)), t : HI64 };
+					case HDyn:
+						readVal(keyPtr,HDyn);
+					default:
+						throw "Unsupported map " + tkey.toString();
+					}
+					content.push({ key : key, value : value });
+					if( isV13 )
+						c = isSmall ? readByte(nexts.offset(c)) : readI32(nexts.offset(c<<2));
+					else
+						c = readI32(entries.offset(c * keyStride + keyStride - 4 - keyPadding));
+				}
+			}
+			return content[k];
+		}
+
+		function getKey(k):Value return k < 0 || k >= nentries ? { v : VUndef, t : tkey } : fetch(k).key;
+		function getValue(k):Value return k < 0 || k >= nentries ? { v : VUndef, t : HDyn } : fetch(k).value;
+
+		return VMap(tkey == HBytes ? t_string : tkey,nentries,getKey, getValue, p);
+	}
+
+	function makeValueWithHint( v : Value ) : Value {
+		switch( [v.v, v.t, v.hint] ) {
+		case [VPointer(p), HAbstract("hl_carray"), HCArray(t, size, pos)]:
+			// hl.CArray
+			var at = module.resolveType(t);
+			var mproto = switch( at ) {
+			case HObj(o): module.getObjectProto(o, false);
+			case HStruct(o): module.getObjectProto(o, true);
+			default: throw "assert: invalid CArray t";
+			}
+			if( pos != null ) {
+				var index = toInt(eval(pos));
+				if( index < 0 )
+					throw "assert: invalid CArray index " + index;
+				return convertVal(p.offset(mproto.size * index), at);
+			} else if( size != null ) {
+				var length = toInt(eval(size));
+				if( length < 0 )
+					throw "assert: invalid CArray size " + size;
+				var varr = VArray(at, length, function(i) return convertVal(p.offset(mproto.size * i), at), null);
+				return { v : varr, t : v.t };
+			} else {
+				throw "Missing CArray size or pos";
+			}
+		case [VBytes(length, read, _), _, HArray(t, size, pos)]:
+			// haxe.io.Bytes and hl.Bytes, the latter with length < 0
+			var tsize = align.typeSize(t);
+			if( pos != null ) {
+				var pos = toInt(eval(pos));
+				return readBytesAt(length, read, t, pos*tsize);
+			}
+			var alen;
+			if( size != null )
+				alen = toInt(eval(size));
+			else if( length >= 0 )
+				alen = Std.int(length / tsize);
+			else
+				throw "Missing Array size or pos";
+			var varr = VArray(t, alen, function(i) return readBytesAt(length, read, t, i*tsize), null);
+			return { v : varr, t : v.t };
+		default:
+		}
+		return v;
+	}
+
+	public function getFields( v : Value ) : Array<String> {
+		var ptr = switch( v.v ) {
+		case VPointer(p): p;
+		case VEnum(_,values,_):
+			// only list the pointer fields (others are displayed in enum anyway)
+			return [for( i in 0...values.length ) if( values[i].t.isPtr() ) "$"+i];
+		case VInlined(fields):
+			return [for( f in fields ) f.name];
+		case VString(_) | VArray(_) | VMap(_) | VBytes(_):
+			return [];
+		default:
+			return null;
+		}
+		switch( v.t ) {
+		case HObj(o), HStruct(o):
+			function getRec(o:format.hl.Data.ObjPrototype) {
+				var fields = o.tsuper == null ? [] : getRec(switch( o.tsuper ) { case HObj(o), HStruct(o): o; default: throw "assert"; });
+				for( f in o.fields )
+					if( f.name != "" )
+						fields.push(f.name);
+				return fields;
+			}
+			return getRec(o);
+		case HVirtual(fields):
+			return [for( f in fields ) f.name];
+		case HDynObj:
+			var lookup = readPointer(ptr.offset(align.ptr));
+			var nfields = readI32(ptr.offset(align.ptr * 4));
+			var fields = [];
+			var hasIndex = false;
+			for( i in 0...nfields ) {
+				var l = lookup.offset(i * (align.ptr + 8));
+				var h = readI32(l.offset(align.ptr)); // hashed_name
+				var index = readI32(l.offset(align.ptr+4)) >>> 17;
+				if( index > 0 )
+					hasIndex = true;
+				var name = module.reverseHash(h);
+				if( name == null ) name = HASH_PREFIX + h;
+				if( hasIndex )
+					fields[index] = name;
+				else
+					fields.push(name);
+			}
+			return fields;
+		default:
+			return null;
+		}
+	}
+
+	public function readField( v : Value, name : String ) : Value {
+		switch( v.v ) {
+		case VEnum(_,values,_) if( name.charCodeAt(0) == "$".code ):
+			return values[Std.parseInt(name.substr(1))];
+		case VMap(t, len, readKey, readValue, _) if( name.charCodeAt(0) == "$".code ):
+			var i = Std.parseInt(name.substr(1));
+			var key = readKey(i);
+			var value = readValue(i);
+			return i < 0 || i >= len ? { v : VUndef, t : t } : { v: VMapPair(key,value), t : t };
+		case VMapPair(key, _) if( name == "$key" ):
+			return key;
+		case VMapPair(_, value) if( name == "$value" ):
+			return value;
+		case VBytes(length, _, _) if( name == "length" && length >= 0 ):
+			return { v : VInt(length), t : HI32 };
+		default:
+		}
+		var a = readFieldAddress(v, name);
+		return fetchAddr(a);
+	}
+
+	public function fetch( addr : Debugger.Address ) {
+		return fetchAddr(addr == null ? ANone : addr.ptr == null ? AUndef(addr.t) : AAddr(addr.ptr, addr.t));
+	}
+
+	function fetchAddr( addr : VarAddress ) : Value {
+		switch( addr ) {
+		case ANone:
+			return null;
+		case AUndef(t):
+			return { v : VUndef, t : t };
+		case AOverwritten(t):
+			return { v : VOverwritten, t : t };
+		case AAddr(ptr,t):
+			return readVal(ptr, t);
+		case ANative(r, t):
+			return convertVal(readNatReg(r), t);
+		case AMethod(v, p, t):
+			var fidx = jit.functionFromAddr(p);
+			var fval = fidx == null ? FUnknown(p) : FIndex(fidx, p);
+			return { v : VMethod(fval,v,p), t : t };
+		case AEvaled(v):
+			return v;
+		case AInlined(fields):
+			return { v : VInlined(fields), t : inlinedType(fields) };
+		}
+	}
+
+	function addrType( a : VarAddress ) : HLType {
+		return switch( a ) {
+		case ANone: HDyn;
+		case AUndef(t), AOverwritten(t), AAddr(_,t), AMethod(_,_,t), ANative(_,t): t;
+		case AEvaled(v): v.t;
+		case AInlined(fields): inlinedType(fields);
+		}
+	}
+
+	function inlinedType( fields : Array<InlinedField> ) : HLType {
+		return HVirtual([for( f in fields ) { name : f.name, t : addrType(f.addr) }]);
+	}
+
+	public function readFieldAddress( v : Value, name : String ) : VarAddress {
+		var ptr = switch( v.v ) {
+		case VUndef, VNull: null;
+		case VPointer(p): p;
+		case VArray(_, _, _, p): p;
+		case VString(_, p): p;
+		case VMap(_, _, _, _, p): p;
+		case VInlined(fields):
+			for( f in fields )
+				if( f.name == name )
+					return f.addr;
+			return ANone;
+		default:
+			return ANone;
+		}
+		switch( v.t ) {
+		case HObj(o), HStruct(o):
+			var p = module.getObjectProto(o,v.t.match(HStruct(_)));
+			var f = p.fields.get(name);
+			if( f != null ) {
+				var offset = f.offset;
+				return ptr == null ? AUndef(f.t) : AAddr(ptr.offset(offset), f.t);
+			}
+			var f = p.methods.get(name);
+			if( f != null ) {
+				if( ptr == null )
+					return AUndef(f.t);
+				// HMethod
+				var vt = readPointer(ptr);
+				var vobj = readPointer(vt.offset(align.ptr));
+				var vrt = readPointer(vobj.offset(4 * 2 + align.ptr + align.ptr * 7));
+				var vmethods = readPointer(vrt.offset(align.ptr + 4 * 6));
+				return AMethod(v, readPointer(vmethods.offset(f.index * align.ptr)), f.t);
+			}
+			var f = p.methods.get("get_"+name);
+			if( f != null ) {
+				if( ptr == null )
+					return AUndef(f.t);
+				if( !allowEvalGetters )
+					throw "Eval not allowed get_" + name + "()";
+				var f = readFieldAddress(v, "get_"+name);
+				switch( f ) {
+				case AMethod(obj, ptr, HFun(ft)) if( ft.args.length == 1 ):
+					if( Debugger.DEBUG || printEvalCall )
+						trace("EVAL "+valueStr(v)+".get_"+name+"()");
+					return AEvaled(evalCall(fetchAddr(f),[obj]));
+				default:
+				}
+			}
+			// Construct VEnum if try access with class.name and no params
+			var ep = module.resolveEnum(o.name.split("$").join(""));
+			if( ep != null )
+				for( c in ep.constructs ) {
+					if( c.name == name ) {
+						return AEvaled({ v : VEnum(name, [for( p in c.params ) { v : VNull, t : HDyn }], Pointer.make(0,0)), t : HEnum(ep) });
+					}
+				}
+			return ANone;
+		case HVirtual(fl):
+			for( i in 0...fl.length )
+				if( fl[i].name == name ) {
+					var t = fl[i].t;
+					if( ptr == null )
+						return AUndef(t);
+					var addr = readPointer(ptr.offset(align.ptr * (3 + i)));
+					if( addr != null )
+						return AAddr(addr, t);
+				}
+			if( ptr == null )
+				return ANone;
+			var realValue = readPointer(ptr.offset(align.ptr));
+			if( realValue.isNull() )
+				return ANone;
+			return readFieldAddress({ v : VPointer(realValue), t : HDyn }, name);
+		case HDynObj:
+			if( ptr == null )
+				return AUndef(HDyn);
+			var lookup = readPointer(ptr.offset(align.ptr * 1));
+			var raw_data = readPointer(ptr.offset(align.ptr * 2));
+			var values = readPointer(ptr.offset(align.ptr * 3));
+			var nfields = readI32(ptr.offset(align.ptr * 4));
+			// lookup, similar to hl_lookup_find
+			var hash = StringTools.startsWith(name,HASH_PREFIX) ? Std.parseInt(name.substr(HASH_PREFIX.length)) : name.hash();
+			var min = 0;
+			var max = nfields;
+			while( min < max ) {
+				var mid = (min + max) >> 1;
+				var lid = lookup.offset(mid * (align.ptr + 8));
+				var h = readI32(lid.offset(align.ptr)); // hashed_name
+				if( h < hash )
+					min = mid + 1;
+				else if( h > hash )
+					max = mid;
+				else {
+					var t = readType(lid);
+					var offset = readI32(lid.offset(align.ptr + 4)) & ((1 << 17) - 1);
+					return AAddr(t.isPtr() ? values.offset(offset * align.ptr) : raw_data.offset(offset), t);
+				}
+			}
+			return ANone;
+		case HDyn:
+			if( ptr == null )
+				return AUndef(HDyn);
+			return readFieldAddress({ v : v.v, t : readType(ptr) }, name);
+		default:
+			return ANone;
+		}
+	}
+
+	public function readPointer( p : Pointer ) {
+		if( align.is64 ) {
+			var m = readMem(p, 8);
+			return m.getPointer(0,align);
+		}
+		return Pointer.make(readI32(p), 0);
+	}
+
+	public function writePointer( p : Pointer, v : Pointer ) {
+		if( align.is64 ) {
+			var buf = new Buffer(8);
+			buf.setPointer(0, v, align);
+			writeMem(p, buf, 8);
+		} else
+			writeI32(p, v.toInt());
+	}
+
+	function readMem( p : Pointer, size : Int ) {
+		var b = new Buffer(size);
+		if( !api.read(p, b, size) )
+			throw "Failed to read @" + p.toString() + ":" + size;
+		return b;
+	}
+
+	function readUCS2( ptr : Pointer, length : Int ) {
+		var mem = readMem(ptr, (length + 1) << 1);
+		return mem.readStringUCS2(0,length);
+	}
+
+	public function readUCSBytes( ptr : Pointer ) {
+		var len = 0;
+		while( true ) {
+			var v = readI32(ptr.offset(len << 1));
+			var low = v & 0xFFFF;
+			var high = v >>> 16;
+			if( low == 0 ) break;
+			len++;
+			if( high == 0 ) break;
+			len++;
+		}
+		return readUCS2(ptr, len);
+	}
+
+	public function readByte( p : Pointer ) {
+		return readMem(p, 1).getUI8(0);
+	}
+
+	public function readI32( p : Pointer ) {
+		return readMem(p, 4).getI32(0);
+	}
+
+	public function readI64( p : Pointer ) {
+		var mem = readMem(p, 8);
+		return haxe.Int64.make(mem.getI32(4),mem.getI32(0));
+	}
+
+	public function writeI32( p : Pointer, v : Int ) {
+		var buf = new Buffer(4);
+		buf.setI32(0,v);
+		writeMem(p, buf, 4);
+	}
+
+	public function writeF64( p : Pointer, v : Float ) {
+		var buf = new Buffer(8);
+		buf.setF64(0,v);
+		writeMem(p, buf, 8);
+	}
+
+	function writeMem( p : Pointer, b : Buffer, size : Int ) {
+		if( !api.write(p, b, size) )
+			throw "Failed to write @" + p.toString() + ":" + size;
+	}
+
+	function readType( p : Pointer, direct = false ) {
+		if( !direct )
+			p = readPointer(p);
+		switch( readI32(p) ) {
+		case 0:
+			return HVoid;
+		case 1:
+			return HUi8;
+		case 2:
+			return HUi16;
+		case 3:
+			return HI32;
+		case 4:
+			return HI64;
+		case 5:
+			return HF32;
+		case 6:
+			return HF64;
+		case 7:
+			return HBool;
+		case 8:
+			return HBytes;
+		case 9:
+			return HDyn;
+		case 10:
+			var t = typeFromAddr(p);
+			if( t != null )
+				return t;
+			// vclosure !
+			var tfun = readPointer(p.offset(align.ptr));
+			var pparent = tfun.offset(align.ptr * 3);
+			if( p.i64 == readPointer(pparent).i64 )
+				return HFun({args:[],ret:HDyn}); // varargs !
+			var tparent = readType(pparent);
+			return switch( tparent ) {
+			case HFun(f): var args = f.args.copy(); args.shift(); HFun({ args : args, ret: f.ret });
+			default: throw "assert";
+			}
+		case 12:
+			return HArray;
+		case 13:
+			return HType;
+		case 14:
+			return HRef(readType(p.offset(align.ptr)));
+		case 16:
+			return HDynObj;
+		case 11, 15, 17, 18, 21: // HObj, HVirtual, HAbstract, HEnum, HStruct
+			return typeFromAddr(p);
+		case 19:
+			return HNull(readType(p.offset(align.ptr)));
+		case 23:
+			return HGUID;
+		case x:
+			throw "Unknown type #" + x;
+		}
+	}
+
+	inline function typeStructSize() {
+		return align.ptr * 4;
+	}
+
+	function typeFromAddr( p : Pointer ) : HLType {
+		var tid = Std.int( p.sub(@:privateAccess jit.allTypes) / typeStructSize() );
+		return module.code.types[tid];
+	}
+
+	function getGuidName( i64 : haxe.Int64 ) : Null<String> {
+		if( guidNames == null ) {
+			guidNames = new Int64Map();
+			if( jit.hlVersion >= 1.15 ) {
+				var pmap = readPointer(jit.threads.offset(jit.align.ptr*3 + 8));
+				if( !pmap.isNull() ) {
+					var m = @:privateAccess makeMap(pmap, HI64);
+					switch( m ) {
+					case VMap(_, nkeys, readKey, readValue, _):
+						for (n in 0...nkeys) {
+							var k = readKey(n);
+							var v = readValue(n);
+							switch( [k.v, v.v] ) {
+							case [VInt64(ki64), VBytes(_, _, vp)] if( v.t.match(HBytes) ):
+								guidNames.set(ki64, readUCSBytes(vp));
+							default:
+							}
+						}
+					default: throw "assert";
+					}
+				}
+			}
+		}
+		return guidNames.get(i64);
+	}
+
+}

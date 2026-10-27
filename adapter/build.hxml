@@ -1,0 +1,13 @@
+-cp src
+-cp .
+-cp ../.deps/hxnodejs/src
+-cp ../.deps/vscode-debugadapter/src
+-cp ../.deps/format
+-cp ../.deps/hscript
+--macro allowPackage('sys')
+--macro define('nodejs')
+-D hxnodejs
+-D js-es=6
+-js adapter.js
+-main HLAdapter
+-debug

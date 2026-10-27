@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HashLink",
+  "type": "object",
+  "required": ["request", "program"],
+  "properties": {
+    "request": { "type": "string", "enum": ["launch", "attach"] },
+    "adapterPath": { "type": "string", "description": "Absolute path to the built adapter/adapter.js. May also be supplied through Zed's debug adapter binary setting." },
+    "program": { "type": "string", "description": "HashLink JIT bytecode (.hl), built with haxe -debug. Also required for attach to read debug information." },
+    "cwd": { "type": "string", "description": "Working directory. Defaults to the project root." },
+    "hl": { "type": "string", "description": "HashLink executable. Defaults to hl on PATH." },
+    "args": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "env": { "type": "object", "additionalProperties": { "type": "string" } },
+    "classPaths": { "type": "array", "items": { "type": "string" }, "description": "Source roots, including library and Haxe standard-library paths when needed. Defaults to cwd." },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 6112 },
+    "connectionTimeout": { "type": "number", "exclusiveMinimum": 0, "default": 10 }
+  }
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "label": "HashLink example",
+    "adapter": "HashLink",
+    "request": "launch",
+    "adapterPath": "$ZED_WORKTREE_ROOT/adapter/adapter.js",
+    "program": "$ZED_WORKTREE_ROOT/examples/main.hl",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "classPaths": ["$ZED_WORKTREE_ROOT/examples"],
+    "build": {
+      "command": "haxe",
+      "args": ["examples/build.hxml"],
+      "cwd": "$ZED_WORKTREE_ROOT"
+    }
+  }
+]

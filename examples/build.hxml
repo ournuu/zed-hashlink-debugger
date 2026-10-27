@@ -1,0 +1,4 @@
+-cp examples
+-main Main
+-debug
+-hl examples/main.hl

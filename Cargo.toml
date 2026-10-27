@@ -1,0 +1,11 @@
+[package]
+name = "zed-hashlink-debugger"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zed_extension_api = "0.7.0"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"

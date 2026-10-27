@@ -1,0 +1,8 @@
+/target
+/.deps
+/upstream
+/adapter/node_modules
+/adapter/adapter.js
+/adapter/adapter.js.map
+/extension.wasm
+/examples/main.hl
