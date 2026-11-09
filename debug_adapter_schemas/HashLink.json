@@ -5,7 +5,7 @@
   "required": ["request", "program"],
   "properties": {
     "request": { "type": "string", "enum": ["launch", "attach"] },
-    "adapterPath": { "type": "string", "description": "Absolute path to the built adapter/adapter.js. May also be supplied through Zed's debug adapter binary setting." },
+    "adapterPath": { "type": "string", "description": "Optional absolute path to an alternate adapter.js. Defaults to adapter/adapter.js in the installed extension." },
     "program": { "type": "string", "description": "HashLink JIT bytecode (.hl), built with haxe -debug. Also required for attach to read debug information." },
     "cwd": { "type": "string", "description": "Working directory. Defaults to the project root." },
     "hl": { "type": "string", "description": "HashLink executable. Defaults to hl on PATH." },

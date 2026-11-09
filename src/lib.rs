@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use zed::serde_json::{Value, json};
 use zed_extension_api::{self as zed, StartDebuggingRequestArgumentsRequest as RequestKind};
 
@@ -25,14 +27,33 @@ impl zed::Extension for HashLinkExtension {
         {
             return Err("Set program to the .hl bytecode file built with haxe -debug (also required for attach)".into());
         }
-        let adapter_path = user_provided_debug_adapter_path
-            .or_else(|| {
-                config
-                    .get("adapterPath")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .ok_or("Set adapterPath to the absolute path of the built adapter/adapter.js")?;
+        let adapter_path = user_provided_debug_adapter_path.or_else(|| {
+            config
+                .get("adapterPath")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let adapter_path = match adapter_path {
+            Some(path) => path,
+            None => {
+                // Zed sets PWD to extensions/work/<id> and links dev extensions under installed/.
+                let work_dir = std::env::var("PWD")
+                    .map_err(|_| "Could not locate the HashLink extension directory")?;
+                let work_dir = if zed::current_platform().0 == zed::Os::Windows {
+                    work_dir.replace('\\', "/")
+                } else {
+                    work_dir
+                };
+                let extensions_dir = Path::new(&work_dir)
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or("Could not locate the HashLink extension directory")?;
+                extensions_dir
+                    .join("installed/hashlink-debugger/adapter/adapter.js")
+                    .display()
+                    .to_string()
+            }
+        };
         let node = worktree
             .which("node")
             .map(Ok)

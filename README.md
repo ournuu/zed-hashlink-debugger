@@ -53,7 +53,6 @@ Add a configuration to the project's `.zed/debug.json`:
     "label": "Debug HashLink",
     "adapter": "HashLink",
     "request": "launch",
-    "adapterPath": "D:/zed-hashlink-debugger/adapter/adapter.js",
     "program": "$ZED_WORKTREE_ROOT/bin/game.hl",
     "cwd": "$ZED_WORKTREE_ROOT",
     "classPaths": ["$ZED_WORKTREE_ROOT/src"],
@@ -62,8 +61,7 @@ Add a configuration to the project's `.zed/debug.json`:
 ]
 ```
 
-Change `adapterPath` to your checkout's absolute path and `program` to your
-bytecode output. Build your application with `haxe -debug`. Add library source
+Set `program` to your bytecode output. Build your application with `haxe -debug`. Add library source
 roots and the Haxe standard-library directory to `classPaths` when needed.
 Unlike VS Code's vshaxe integration, this extension does not infer these from HXML.
 You can add a Zed `build` task as in this repository's `.zed/debug.json`.
@@ -75,8 +73,9 @@ example, `"PATH": "D:/my/runtime;${env:PATH}"` prepends a directory on Windows.
 Environment variable names are case-insensitive on Windows. References always
 read the inherited environment, before applying this configuration's overrides.
 `cwd` defaults to the project root, and `classPaths` defaults to `cwd`.
-To avoid repeating `adapterPath`, set Zed's `dap.HashLink.binary` to the absolute
-path of `adapter.js`. The extension invokes that JavaScript file with Node.js.
+Zed starts the `adapter/adapter.js` built in the extension checkout. To use an
+alternate adapter, set `adapterPath` in the debug configuration or
+`dap.HashLink.binary` in Zed's settings to its absolute path.
 
 For attach, start your application separately:
 
